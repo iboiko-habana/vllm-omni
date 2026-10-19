@@ -40,18 +40,9 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # Keep the upstream oneCCL, torch and Triton packages paired. The final
 # vLLM XPU wheel requires triton==3.8.0+xpu; installing the old triton-xpu
 # overlay would replace that runtime with an incompatible version.
-# The base image upgrades these oneAPI runtime packages past torch's exact
-# pins; override them so resolving ".[dev]" does not roll them back.
-# The base image already fails `uv pip check`, so only fail on new conflicts.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    RUNTIME_PKGS='oneccl|oneccl-devel|intel-sycl-rt|intel-cmplr-lib-rt|intel-cmplr-lib-ur|intel-cmplr-lic-rt|dpcpp-cpp-rt|intel-opencl-rt|intel-openmp|intel-pti' && \
-    OVERRIDES="$(uv pip freeze | grep -iE "^(${RUNTIME_PKGS})==")" && \
-    echo "${OVERRIDES}" && \
-    BASE_CHECK="$(uv pip check 2>&1 | grep -E '^The package' | sort || true)" && \
-    uv pip install --no-build-isolation --override <(echo "${OVERRIDES}") \
-    ".[dev]" && \
-    NEW_CHECK="$(comm -13 <(echo "${BASE_CHECK}") <(uv pip check 2>&1 | grep -E '^The package' | sort || true))" && \
-    { [ -z "${NEW_CHECK}" ] || { echo "${NEW_CHECK}"; exit 1; }; }
+    uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
+    ".[dev]"
 
 FROM vllm-omni AS vllm-omni-openai
 
