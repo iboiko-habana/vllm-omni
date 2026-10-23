@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +8,7 @@ import torch
 
 import vllm_omni.diffusion.graph as graph_mod
 import vllm_omni.diffusion.profiler.diffusion_pipeline_profiler as profiler_mod
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.graph import DenoiseGraphRunner, build_denoise_graph_runner, write_through
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -24,32 +24,44 @@ class _FakeGraph:
         self.replay_fn()
 
 
-class _FakeGraphs:
-    """Stands in for torch.cuda/xpu graphs on CPU.
+class _FakePlatform:
+    """Stands in for ``current_omni_platform`` graph capture on CPU.
 
     A call made under capture is recorded against the exact tensors it received,
     and its output is blanked, because a real capture records kernels without
     running them. Replay recomputes into that same output tensor.
     """
 
+    device_type = "cpu"
+
     def __init__(self) -> None:
         self.capturing: _FakeGraph | None = None
+        self.outer_capture = False
         self.graphs: list[_FakeGraph] = []
 
-    def new_graph(self, device):
-        del device
+    def capture_graph(self, capture, generators=()):
+        del generators
         graph = _FakeGraph()
         self.graphs.append(graph)
-        return graph
-
-    @contextmanager
-    def context(self, graph, device, pool):
-        del device, pool
         self.capturing = graph
         try:
-            yield
+            capture()
         finally:
             self.capturing = None
+        return graph
+
+    @staticmethod
+    def replay_graph(graph, eager):
+        if graph is None:
+            eager()
+            return
+        graph.replay()
+
+    def is_graph_capturing(self) -> bool:
+        return self.outer_capture or self.capturing is not None
+
+    def synchronize(self) -> None:
+        pass
 
     def wrap(self, fn):
         def body(**kwargs):
@@ -65,14 +77,9 @@ class _FakeGraphs:
 
 @pytest.fixture
 def fake_graphs(monkeypatch):
-    fakes = _FakeGraphs()
-    monkeypatch.setattr(graph_mod, "graphs_supported", lambda device: (True, ""))
-    monkeypatch.setattr(graph_mod, "_is_capturing", lambda device: False)
-    monkeypatch.setattr(graph_mod, "_synchronize", lambda device: None)
-    monkeypatch.setattr(graph_mod, "_graph_pool_handle", lambda device: None)
-    monkeypatch.setattr(graph_mod, "_new_graph", fakes.new_graph)
-    monkeypatch.setattr(graph_mod, "_graph_context", fakes.context)
-    return fakes
+    fake = _FakePlatform()
+    monkeypatch.setattr(graph_mod, "current_omni_platform", fake)
+    return fake
 
 
 def _affine(x: torch.Tensor, mode: str = "gen_image") -> torch.Tensor:
@@ -150,10 +157,10 @@ def test_invalidate_drops_graphs_but_keeps_capturing(fake_graphs):
 
 
 def test_capture_failure_disables_runner_and_falls_back_to_eager(fake_graphs, monkeypatch):
-    def failing_context(graph, device, pool):
+    def failing_capture(capture, generators=()):
         raise RuntimeError("UR_RESULT_ERROR_UNSUPPORTED_FEATURE")
 
-    monkeypatch.setattr(graph_mod, "_graph_context", failing_context)
+    monkeypatch.setattr(fake_graphs, "capture_graph", failing_capture)
     runner = DenoiseGraphRunner(fn=_affine, name="t")
 
     first = runner(x=torch.ones(2))
@@ -175,8 +182,18 @@ def test_non_tensor_return_disables_runner(fake_graphs):
     assert not runner.enabled
 
 
-def test_unsupported_device_disables_runner(fake_graphs, monkeypatch):
-    monkeypatch.setattr(graph_mod, "graphs_supported", lambda device: (False, "no graphs"))
+def test_platform_without_graphs_disables_runner(fake_graphs, monkeypatch):
+    monkeypatch.setattr(fake_graphs, "capture_graph", lambda capture, generators=(): None)
+    runner = DenoiseGraphRunner(fn=_affine, name="t")
+
+    torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
+    torch.testing.assert_close(runner(x=torch.zeros(2)), torch.full((2,), 1.0))
+    assert not runner.enabled
+    assert runner.stats_snapshot()["captures"] == 0
+
+
+def test_arguments_off_the_platform_device_disable_runner(fake_graphs, monkeypatch):
+    monkeypatch.setattr(fake_graphs, "device_type", "xpu")
     runner = DenoiseGraphRunner(fn=_affine, name="t")
 
     torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
@@ -189,8 +206,8 @@ def test_unsupported_device_disables_runner(fake_graphs, monkeypatch):
     [({"x": torch.ones(2)}, True), ({"x": 1.0}, False)],
     ids=["outer-capture-in-flight", "no-tensor-arguments"],
 )
-def test_runs_eager_without_disabling(fake_graphs, monkeypatch, kwargs, outer_capture):
-    monkeypatch.setattr(graph_mod, "_is_capturing", lambda device: outer_capture)
+def test_runs_eager_without_disabling(fake_graphs, kwargs, outer_capture):
+    fake_graphs.outer_capture = outer_capture
     runner = DenoiseGraphRunner(fn=_affine, name="t")
 
     runner(**kwargs)
@@ -198,12 +215,6 @@ def test_runs_eager_without_disabling(fake_graphs, monkeypatch, kwargs, outer_ca
     assert runner.enabled
     assert runner.stats_snapshot()["eager"] == 1
     assert not fake_graphs.graphs
-
-
-def test_graphs_supported_rejects_cpu():
-    ok, reason = graph_mod.graphs_supported(torch.device("cpu"))
-    assert not ok
-    assert "cpu" in reason
 
 
 def test_write_through_reuses_storage_only_when_layout_matches():
@@ -225,9 +236,12 @@ def test_profiler_skips_synchronize_during_capture(monkeypatch, capturing, expec
     monkeypatch.setattr(
         profiler_mod,
         "current_omni_platform",
-        SimpleNamespace(is_available=lambda: True, synchronize=lambda: syncs.append(1)),
+        SimpleNamespace(
+            is_available=lambda: True,
+            is_graph_capturing=lambda: capturing,
+            synchronize=lambda: syncs.append(1),
+        ),
     )
-    monkeypatch.setattr(profiler_mod, "_capture_in_flight", lambda: capturing)
 
     profiler_mod._sync_if_useful()
 
@@ -237,6 +251,8 @@ def test_profiler_skips_synchronize_during_capture(monkeypatch, capturing, expec
 def _od_config(**overrides):
     fields = dict(
         diffusion_use_graph=True,
+        enforce_eager=False,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -256,6 +272,9 @@ def test_build_runner_when_requested_and_safe():
     ("overrides", "refusal"),
     [
         ({"diffusion_use_graph": False}, None),
+        ({"enforce_eager": True}, None),
+        ({"diffusion_kv_mode": DiffusionKVCacheMode.PAGED_SCHEDULER}, None),
+        ({"diffusion_kv_mode": "paged_scheduler"}, None),
         ({"cache_backend": "cache_dit"}, None),
         ({"enable_cpu_offload": True}, None),
         ({"enable_layerwise_offload": True}, None),
@@ -269,6 +288,12 @@ def test_build_runner_stays_eager_when_unsafe(overrides, refusal):
 
 def test_is_capturing_is_false_for_cpu():
     assert graph_mod.is_capturing(torch.device("cpu")) is False
+
+
+def test_is_capturing_follows_the_platform(fake_graphs):
+    fake_graphs.outer_capture = True
+    assert graph_mod.is_capturing(torch.device("cpu")) is True
+    assert graph_mod.is_capturing(torch.device("meta")) is False
 
 
 @pytest.mark.parametrize(

@@ -400,6 +400,15 @@ class OmniPlatform(Platform):
         graph.replay()
 
     @classmethod
+    def is_graph_capturing(cls) -> bool:
+        """Whether a device graph is recording on the current stream.
+
+        Host synchronization (``synchronize()``, ``.item()``) is illegal while
+        capturing, so callers that would otherwise sync check this first.
+        """
+        return cls.is_cuda_alike() and torch.cuda.is_current_stream_capturing()
+
+    @classmethod
     def set_forward_context(
         cls,
         attn_metadata: Any,
