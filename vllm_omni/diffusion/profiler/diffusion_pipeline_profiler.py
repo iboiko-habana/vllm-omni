@@ -8,7 +8,6 @@ from collections.abc import Callable
 from threading import Lock
 from typing import Any
 
-import torch
 from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
@@ -16,29 +15,11 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
-def _capture_in_flight() -> bool:
-    """True while a device graph capture is recording on the current stream.
-
-    A host synchronize inside a capture is not merely a stall, it is an error:
-    Level Zero rejects it with UR_RESULT_ERROR_UNSUPPORTED_FEATURE, which would
-    take down capture of any region that contains a profiled target. Skipping it
-    costs nothing that matters, because capture records kernels without running
-    them -- there is no device work for the sync to wait on.
-    """
-    for mod in (torch.xpu, torch.cuda):
-        is_capturing = getattr(mod, "is_current_stream_capturing", None)
-        if is_capturing is None or not mod.is_available():
-            continue
-        try:
-            if is_capturing():
-                return True
-        except Exception:
-            continue
-    return False
-
-
 def _sync_if_useful() -> None:
-    if current_omni_platform.is_available() and not _capture_in_flight():
+    # Level Zero rejects a host synchronize inside a graph capture with
+    # UR_RESULT_ERROR_UNSUPPORTED_FEATURE. Skipping it there costs nothing:
+    # capture records kernels without running them.
+    if current_omni_platform.is_available() and not current_omni_platform.is_graph_capturing():
         current_omni_platform.synchronize()
 
 

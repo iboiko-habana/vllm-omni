@@ -14,11 +14,12 @@ to 13.9k sub-millisecond gaps between kernels. So a graph is worth roughly 10%
 here -- not the 3.8x that the launch-bound AR decode loop gets from the same
 mechanism. Expect single digits to low teens.
 
-CUDA spells graphs ``torch.cuda.CUDAGraph``, XPU spells them
-``torch.xpu.XPUGraph``. vLLM's XPU model runner monkey-patches the former onto
-the latter, but only in a process that constructs an AR/generation model runner
--- the diffusion worker is a separate process, so this module dispatches on the
-device type rather than relying on that alias being installed.
+Capture and replay go through ``current_omni_platform.capture_graph`` /
+``replay_graph``, so the device specifics live in one place per platform: CUDA
+captures into vLLM's global graph pool, while XPU gives every graph a private
+pool, because on torch 2.14+xpu capturing into a shared pool after another graph
+in it was freed hits an XPUCachingAllocator assert. Platforms without graph
+support return ``None`` from ``capture_graph`` and the runner stays eager.
 
 Safety model: every tensor argument is copied into a capture-owned static
 buffer before each replay, so the runner never depends on the caller handing
@@ -39,6 +40,9 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.platforms import current_omni_platform
+
 logger = init_logger(__name__)
 
 
@@ -57,59 +61,13 @@ def write_through(dst: torch.Tensor | None, src: torch.Tensor) -> torch.Tensor:
     return src
 
 
-def graphs_supported(device: torch.device) -> tuple[bool, str]:
-    """Whether this device can capture graphs, and why not when it cannot."""
-    if device.type == "cuda":
-        return True, ""
-    if device.type == "xpu":
-        # torch.xpu.XPUGraph landed in torch 2.11.0.dev.
-        if not hasattr(torch.xpu, "XPUGraph") or not hasattr(torch.xpu, "graph"):
-            return False, f"torch {torch.__version__} has no torch.xpu.XPUGraph"
-        return True, ""
-    return False, f"device type {device.type!r} has no graph support"
-
-
-def _new_graph(device: torch.device) -> Any:
-    if device.type == "xpu":
-        return torch.xpu.XPUGraph()
-    return torch.cuda.CUDAGraph()
-
-
-def _graph_context(graph: Any, device: torch.device, pool: Any) -> Any:
-    if device.type == "xpu":
-        return torch.xpu.graph(graph, pool=pool)
-    return torch.cuda.graph(graph, pool=pool)
-
-
-def _graph_pool_handle(device: torch.device) -> Any:
-    """A shared memory pool, so N graphs do not reserve N private arenas."""
-    try:
-        if device.type == "xpu":
-            return torch.xpu.graph_pool_handle()
-        return torch.cuda.graph_pool_handle()
-    except Exception:
-        # A private pool per graph still works, it just costs more memory.
-        return None
-
-
-def _is_capturing(device: torch.device) -> bool:
-    """True while a capture is already in flight; graphs must not nest."""
-    mod = torch.xpu if device.type == "xpu" else torch.cuda
-    fn = getattr(mod, "is_current_stream_capturing", None)
-    return bool(fn()) if fn is not None else False
-
-
 def is_capturing(device: torch.device) -> bool:
     """Whether a device graph is recording on ``device``'s current stream.
 
     For host-side checks that read a device tensor (``.item()``, ``bool()``):
     such a read synchronizes, which a capture rejects.
     """
-    return device.type in ("cuda", "xpu") and _is_capturing(device)
-
-
-def _synchronize(device: torch.device) -> None:
-    torch.accelerator.synchronize(device)
+    return device.type == current_omni_platform.device_type and current_omni_platform.is_graph_capturing()
 
 
 def _structural_key(value: Any) -> Any:
@@ -229,12 +187,11 @@ class DenoiseGraphRunner:
                 logger.warning_once("%s: no device tensor among the arguments; running eager", self.name)
             self._stats["eager"] += 1
             return self.fn(**kwargs)
-        ok, reason = graphs_supported(device)
-        if not ok:
-            self.disable(reason)
+        if device.type != current_omni_platform.device_type:
+            self.disable(f"arguments are on {device.type!r}, not on the {current_omni_platform.device_type!r} platform")
             self._stats["eager"] += 1
             return self.fn(**kwargs)
-        if _is_capturing(device):
+        if current_omni_platform.is_graph_capturing():
             # Already inside someone else's capture; recording a nested graph is
             # not allowed, and the outer capture covers these kernels anyway.
             logger.warning_once("%s: an outer capture is in flight; running eager", self.name)
@@ -252,7 +209,7 @@ class DenoiseGraphRunner:
             return self.fn(**kwargs)
 
         if entry is None:
-            entry = self._capture(kwargs, device)
+            entry = self._capture(kwargs)
             if entry is None:
                 self._stats["eager"] += 1
                 return self.fn(**kwargs)
@@ -262,14 +219,14 @@ class DenoiseGraphRunner:
             self._stats["captures"] += 1
             # Capture records kernels without running them, so the static output
             # holds nothing until the first replay.
-            entry.graph.replay()
+            self._replay(entry)
             return entry.static_out
 
         self._cache.move_to_end(key)
         self._stats["hits"] += 1
         for name, static in entry.static_in.items():
             _copy_into_static(static, kwargs[name])
-        entry.graph.replay()
+        self._replay(entry)
         # The caller gets the graph's own output buffer. It stays valid until the
         # next replay, and every consumer is enqueued on this stream before then.
         return entry.static_out
@@ -285,8 +242,16 @@ class DenoiseGraphRunner:
             return False
         return all(_non_tensor_parts(v) == entry.constants[k] for k, v in kwargs.items())
 
-    def _capture(self, kwargs: dict[str, Any], device: torch.device) -> _GraphEntry | None:
+    def _replay(self, entry: _GraphEntry) -> None:
+        current_omni_platform.replay_graph(entry.graph, lambda: entry.static_out.copy_(self.fn(**entry.static_in)))
+
+    def _capture(self, kwargs: dict[str, Any]) -> _GraphEntry | None:
         static_in = {k: _clone_static(v) for k, v in kwargs.items()}
+        captured: list[torch.Tensor] = []
+
+        def body() -> None:
+            captured.append(self.fn(**static_in))
+
         try:
             # Warm run outside capture: kernel autotuning, lazy module init and
             # any torch.compile guard/codegen must not happen under capture.
@@ -295,10 +260,9 @@ class DenoiseGraphRunner:
             if not isinstance(warm, torch.Tensor):
                 self.disable(f"callee returned {type(warm).__name__}, expected a Tensor")
                 return None
-            _synchronize(device)
-            graph = _new_graph(device)
-            with torch.no_grad(), _graph_context(graph, device, _graph_pool_handle(device)):
-                static_out = self.fn(**static_in)
+            current_omni_platform.synchronize()
+            with torch.no_grad():
+                graph = current_omni_platform.capture_graph(body)
         except Exception:
             logger.warning(
                 "%s: graph capture failed, continuing eager for the rest of the process",
@@ -307,6 +271,10 @@ class DenoiseGraphRunner:
             )
             self.enabled = False
             return None
+        if graph is None:
+            self.disable(f"{type(current_omni_platform).__name__} cannot capture device graphs")
+            return None
+        static_out = captured[0]
         shapes = {k: tuple(v.shape) for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
         logger.info("%s: captured denoise graph, input shapes %s", self.name, shapes)
         return _GraphEntry(
@@ -346,6 +314,14 @@ def build_denoise_graph_runner(
         return None
     cache_backend = getattr(od_config, "cache_backend", None) or "none"
     parallel_config = getattr(od_config, "parallel_config", None)
+    kv_mode = DiffusionKVCacheMode(getattr(od_config, "diffusion_kv_mode", None) or DiffusionKVCacheMode.DENSE_LEGACY)
+    if refusal is None and getattr(od_config, "enforce_eager", False):
+        refusal = "enforce_eager=True"
+    if refusal is None and kv_mode is not DiffusionKVCacheMode.DENSE_LEGACY:
+        # The attention layers take the paged KV adapter (block tables, slot
+        # mapping) from the forward context, not from the step's arguments, so
+        # a replay would keep reading the capture-time request's KV layout.
+        refusal = f"diffusion_kv_mode={kv_mode.value!r} reads per-request paged KV state outside the step arguments"
     if refusal is None and cache_backend != "none":
         refusal = f"cache_backend={cache_backend!r} decides per step whether the transformer runs at all"
     if refusal is None and (
