@@ -1014,9 +1014,10 @@ class ImageKVCacheManager(nn.Module):
         prev_key, prev_value = self._prompt_kv_storage or (None, None)
         reused_key = write_through(prev_key, key)
         reused_value = write_through(prev_value, value)
-        self.prompt_kv_reallocated = reused_key is key or reused_value is value
+        reused_lens = write_through(self._prompt_kv_lens_storage, lens)
+        self.prompt_kv_reallocated = reused_key is key or reused_value is value or reused_lens is lens
         self._prompt_kv_storage = (reused_key, reused_value)
-        self._prompt_kv_lens_storage = write_through(self._prompt_kv_lens_storage, lens)
+        self._prompt_kv_lens_storage = reused_lens
         self.image_kv_cache_map = self._prompt_kv_storage
         self.image_kv_cache_lens = self._prompt_kv_lens_storage
 
