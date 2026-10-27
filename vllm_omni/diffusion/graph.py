@@ -32,6 +32,7 @@ caller's responsibility -- see :meth:`DenoiseGraphRunner.__call__`.
 
 from __future__ import annotations
 
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -44,6 +45,11 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Every live runner in this process, so state owned outside the pipeline (LoRA
+# adapters) can drop the graphs that froze it. Keyed by id(): runners are
+# dataclasses and therefore unhashable.
+_RUNNERS: weakref.WeakValueDictionary[int, DenoiseGraphRunner] = weakref.WeakValueDictionary()
 
 
 def write_through(dst: torch.Tensor | None, src: torch.Tensor) -> torch.Tensor:
@@ -158,6 +164,9 @@ class DenoiseGraphRunner:
     _cache: OrderedDict[Any, _GraphEntry] = field(default_factory=OrderedDict, repr=False)
     _stats: dict[str, int] = field(default_factory=lambda: dict.fromkeys(("calls", "hits", "captures", "eager"), 0))
 
+    def __post_init__(self) -> None:
+        _RUNNERS[id(self)] = self
+
     def stats_snapshot(self) -> dict[str, int]:
         return {**self._stats, "cache_size": len(self._cache)}
 
@@ -269,7 +278,8 @@ class DenoiseGraphRunner:
                 self.name,
                 exc_info=True,
             )
-            self.enabled = False
+            # disable() also frees the graphs captured so far: none can replay again.
+            self.disable("graph capture failed")
             return None
         if graph is None:
             self.disable(f"{type(current_omni_platform).__name__} cannot capture device graphs")
@@ -283,6 +293,17 @@ class DenoiseGraphRunner:
             static_out=static_out,
             constants={k: _non_tensor_parts(v) for k, v in kwargs.items()},
         )
+
+
+def invalidate_denoise_graphs(reason: str) -> None:
+    """Drop every captured denoise graph in this process; later steps recapture.
+
+    For state a graph froze that lives outside the step arguments and outside
+    the pipeline, such as which LoRA adapter is active: its Python branches ran
+    once at capture time, so a replay keeps the capture-time adapter.
+    """
+    for runner in list(_RUNNERS.values()):
+        runner.invalidate(reason)
 
 
 def _first_tensor_device(kwargs: Mapping[str, Any]) -> torch.device | None:
@@ -307,6 +328,10 @@ def build_denoise_graph_runner(
 
     ``refusal`` lets the pipeline add its own reason to stay eager.
     """
+    # Lazy: the offloader package imports diffusion.data, which imports the LoRA
+    # manager, which imports this module.
+    from vllm_omni.diffusion.offloader.config import offload_enabled
+
     requested = bool(getattr(od_config, "diffusion_use_graph", False))
     # Stated either way: a silent None is indistinguishable from "engaged and did not pay".
     logger.info("%s: diffusion_use_graph=%s", name, requested)
@@ -324,9 +349,9 @@ def build_denoise_graph_runner(
         refusal = f"diffusion_kv_mode={kv_mode.value!r} reads per-request paged KV state outside the step arguments"
     if refusal is None and cache_backend != "none":
         refusal = f"cache_backend={cache_backend!r} decides per step whether the transformer runs at all"
-    if refusal is None and (
-        getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-    ):
+    if refusal is None and offload_enabled(od_config):
+        # Every strategy (model-level, layerwise, distributed layerwise) and the
+        # diffusion_offload_config API: hooks move or all-gather the weights.
         refusal = "CPU offload moves the weights that a captured graph reads"
     if refusal is None and getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
         refusal = "pipeline parallelism hands intermediate tensors between stages"
