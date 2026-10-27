@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
+import os
+import re
+import subprocess
+import sys
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -15,6 +20,7 @@ AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
+AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
@@ -58,6 +64,23 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
+TINY_DIFFUSION_JOBS = (
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
+        "mi300_2",
+        12,
+        "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-2gpu/**/*",
+    ),
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
+        "mi300_4",
+        11,
+        "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-4gpu/**/*",
+    ),
+)
 
 COMBINER_SPEC = spec_from_file_location("combine_test_suites", AMD_SUITE_COMBINER)
 assert COMBINER_SPEC is not None and COMBINER_SPEC.loader is not None
@@ -92,6 +115,23 @@ def _walk_steps(steps: list[dict]):
     for step in steps:
         yield step
         yield from _walk_steps(step.get("steps", []))
+
+
+_MARK_EXPRESSION = re.compile(r"(?:^|\s)-m\s+(['\"])(.*?)\1", re.DOTALL)
+
+
+def _marker_expressions(step: dict) -> list[str]:
+    return [match.group(2) for command in step.get("commands", []) for match in _MARK_EXPRESSION.finditer(command)]
+
+
+def _amd_marker_selector_inventory(marker: str) -> set[tuple[Path, str, str]]:
+    return {
+        (pipeline_path, step["label"], expression)
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE)
+        for step in _walk_steps(yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))["steps"])
+        for expression in _marker_expressions(step)
+        if re.search(rf"\b{re.escape(marker)}\b", expression)
+    }
 
 
 def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
@@ -565,9 +605,170 @@ def test_joy_gpu_suite_remains_selected_by_cuda_model_lane() -> None:
     assert "pytest.mark.cpu" not in Path(JOY_GPU_PATH).read_text(encoding="utf-8")
 
 
+# These jobs previously selected CUDA-marked items on AMD. Each migrated lane
+# now selects its qualified ROCm variants and verifies the exact collection
+# before running the GPU workload.
+_ROCM_MIGRATED_AMD_GPU_JOBS = (
+    (
+        "Diffusion · Model Test",
+        AMD_READY_PIPELINE,
+        "Blocking",
+        117,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
+        AMD_READY_PIPELINE,
+        "NonBlocking",
+        1416,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "ROCm · Entrypoints GPU Coverage (R2-02)",
+        AMD_READY_PIPELINE,
+        "NonBlocking",
+        3,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "Diffusion · LoRA Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        1,
+        "advanced_model and rocm and MI325 and cards_1 and not nvidia_only",
+    ),
+    (
+        "Diffusion · Wan22 Offline Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        2,
+        "advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only",
+    ),
+    (
+        "Diffusion · Wan22 Online Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        1,
+        "advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only",
+    ),
+    (
+        "Omni Model Test Qwen3-Omni",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        17,
+        "advanced_model and rocm and MI325 and not nvidia_only",
+    ),
+    (
+        "Qwen3-TTS Base E2E Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        3,
+        "advanced_model and rocm and MI325 and cards_1 and not nvidia_only",
+    ),
+)
+
+
+def test_ready_and_merge_pipelines_have_no_cuda_marker_selectors() -> None:
+    assert _amd_marker_selector_inventory("cuda") == set()
+
+
+def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
+    for label, pipeline_path, grade, expected_count, marker_expression in _ROCM_MIGRATED_AMD_GPU_JOBS:
+        step = _find_step(label, pipeline_path)
+        assert step.get("grade") == grade
+
+        collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        run_commands = [
+            command
+            for command in step["commands"]
+            if AMD_COLLECTION_GUARD.name not in command
+            and marker_expression in _marker_expressions({"commands": [command]})
+        ]
+        assert len(collect_commands) == 1
+        assert len(run_commands) == 1
+        assert _marker_expressions({"commands": collect_commands}) == [marker_expression]
+        assert _marker_expressions({"commands": run_commands}) == [marker_expression]
+
+        collect_argv = split(collect_commands[0])
+        bash_at = collect_argv.index("bash")
+        assert collect_argv[bash_at : bash_at + 2] == ["bash", str(AMD_COLLECTION_GUARD)]
+        assert collect_argv[bash_at + 2] == str(expected_count)
+        if "Shard %N/%t" in label:
+            assert '$${BUILDKITE_PARALLEL_JOB:-0}" == "0"' in collect_commands[0]
+
+
+def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
+    guard = AMD_COLLECTION_GUARD.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in guard
+    assert 'pytest --collect-only -q "$@"' in guard
+    assert "^tests\\/.*::" in guard
+    assert '"${actual_count}" != "${expected_count}"' in guard
+
+
+@pytest.mark.parametrize(("label", "agent_pool", "expected_count", "markers", "artifacts"), TINY_DIFFUSION_JOBS)
+def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
+    label: str,
+    agent_pool: str,
+    expected_count: int,
+    markers: str,
+    artifacts: str,
+) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == agent_pool
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == [artifacts]
+    assert "retry" not in step
+
+    commands = step["commands"]
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
+    run_commands = [command for command in commands if "pytest -s" in command]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_command = collect_commands[0]
+    run_command = run_commands[0]
+    collect_argv = split(collect_command)
+    run_argv = split(run_command)
+    assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
+    assert collect_argv[2] == str(expected_count)
+
+    for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
+        assert TINY_DIFFUSION_PATH in argv
+        assert _marker_expressions({"commands": [command]}) == [markers]
+        assert argv[argv.index("--run-level") + 1] == "core_model"
+
+    for cuda_marker in ("cuda", "L4", "H100", "B200"):
+        assert re.search(rf"\b{cuda_marker}\b", markers) is None
+
+    all_commands = "\n".join(commands)
+    assert "collection.txt" in all_commands
+    assert "pytest.xml" in all_commands
+    assert "pytest.log" in all_commands
+    assert "pytest-summary.txt" in all_commands
+
+
+def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
+    cpu_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment.py").read_text(encoding="utf-8")
+    cuda_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment_cuda.py").read_text(
+        encoding="utf-8"
+    )
+    assert "pytest.mark.cpu" in cpu_case
+    assert "rocm" not in cpu_case
+    assert 'res={"cuda": "L4"}' in cuda_case
+    assert "rocm" not in cuda_case
+
+
 def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
     step = _find_step("Diffusion · Model Test", AMD_READY_PIPELINE)
-    argv = split(next(command for command in step["commands"] if "tests/diffusion/models/" in split(command)))
+    argv = split(
+        next(command for command in step["commands"] if split(command)[:4] == ["timeout", "15m", "pytest", "-sv"])
+    )
 
     assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
@@ -576,7 +777,8 @@ def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
     assert "--ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py" in argv
     assert "--ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in argv
     assert argv[argv.index("-m") + 1] == (
-        "core_model and cuda and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
     )
     assert argv[argv.index("--run-level") + 1] == "core_model"
 
@@ -652,12 +854,12 @@ def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     commands = step["commands"]
 
     assert all("bash -c" not in command for command in commands)
-    pytest_command = next(command for command in commands if "pytest" in command)
+    pytest_command = next(command for command in commands if "pytest" in split(command))
     argv = split(pytest_command)
 
     marker_index = argv.index("-m")
     run_level_index = argv.index("--run-level")
-    assert argv[marker_index + 1] == "advanced_model and cuda"
+    assert argv[marker_index + 1] == "advanced_model and rocm and MI325 and cards_1 and not nvidia_only"
     assert argv[run_level_index + 1] == "advanced_model"
 
 
@@ -816,7 +1018,8 @@ def test_ready_jobs_restore_bf16_aiter_module_without_publishing(label: str, pyt
     step = _find_step(label, AMD_READY_PIPELINE)
 
     assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
+    assert step["depends_on"] == "amd-fa-aiter"
+    assert step["env"] == {"VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP": "amd-fa-aiter"}
     assert step["mirror_hardwares"] == ["amdproduction"]
     _assert_build_scoped_aiter_mha_cache(step, pytest_marker, publishes=False)
     assert all("VLLM_ROCM_USE_AITER=0" not in command for command in step["commands"])
@@ -827,7 +1030,9 @@ def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     pytest_commands = [command for command in step["commands"] if "pytest" in command]
 
     assert step["agent_pool"] == "mi300_1"
+    assert step["key"] == "amd-fa-aiter"
     assert step["depends_on"] == "amd-build"
+    assert "VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP" not in step.get("env", {})
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 60
@@ -1197,3 +1402,460 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         assert "MiniMax-H3 Timeline Guide Accuracy" not in text
         assert "MiniMax-H3 I2VA Ref2VA Accuracy" not in text
+
+
+def test_minicpmo_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o 4.5 Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["SEED_TTS_WER_EVAL"] == "1"
+    assert step["env"]["SEED_TTS_SIM_EVAL"] == "1"
+    assert "SEED_TTS_EVAL_DEVICE" not in commands
+    assert "SEED_TTS_UTMOS_EVAL" not in commands
+    assert "Expected exactly $${#nodes[@]} MiniCPM-o 4.5 accuracy nodes" in commands
+    for node in (
+        "test_minicpmo_4_5_daily_omni_accuracy_bench",
+        "test_minicpmo_4_5_seed_tts_wer_bench",
+    ):
+        assert node in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o 4.5 Accuracy" not in text
+
+
+def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen-Image 2.1 Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["QWEN_IMAGE_21_CALIBRATE"] == "0"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert "setup_reference.sh" in commands
+    assert "test_qwen_image_21_matches_reference[it2i]" in commands
+    assert "test_qwen_image_21_matches_reference[t2i]" in commands
+    assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
+    accuracy_test = Path("tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("BUILDKITE_COMMIT")' in accuracy_test
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image 2.1 Accuracy" not in text
+
+
+def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen3-Omni Seed-TTS Realtime Perf", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["env"]["BENCHMARK_DIR"] == (
+        "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf/benchmark-results"
+    )
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-seed-tts-perf/**/*"]
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json" in commands
+    assert "hf_hub_download" in commands
+    assert "SILERO_VAD_REVISION" in commands
+    assert "SileroVADBackendProvider().get()" in commands
+    assert "test_qwen3_omni_seed_tts_realtime-explicit" in commands
+    assert "test_qwen3_omni_seed_tts_realtime-vad" in commands
+    assert "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes" in commands
+    assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+    assert "Expected exactly 2 Qwen3-Omni Seed-TTS result JSON files" in commands
+    assert "Expected exactly one Qwen3-Omni Seed-TTS $$name result JSON" in commands
+    config = json.loads(Path("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json").read_text(encoding="utf-8"))
+    assert config[0]["mark"][0]["hardware_marks"]["res"]["rocm"] == "MI325"
+    benchmark_params = config[0]["benchmark_params"]
+    assert len(benchmark_params) == 2
+    assert {params["name"] for params in benchmark_params} == {"explicit", "vad"}
+    assert all("baseline" not in params for params in benchmark_params)
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen3-Omni Seed-TTS Realtime Perf" not in text
+
+
+def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 240
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert step["artifact_paths"] == [
+        "artifacts/rocm-omni-duplex-eval/collection.txt",
+        "tests/dfx/perf/results/*.json",
+        "tests/e2e/accuracy/omni_duplex_eval/results/*.json",
+    ]
+    assert "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/collection.txt" in commands
+    assert "pytest.xml" not in commands
+    assert "pytest.log" not in commands
+    assert "timeout --signal=INT --kill-after=2m 220m" in commands
+    assert step["env"]["BENCHMARK_DIR"] == "tests/dfx/perf/results"
+    assert step["env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omni_duplex_eval/results"
+    assert "test_minicpmo_4_5_omni_duplex_eval.json" in commands
+    assert "Expected exactly one MiniCPM-o Omni-DuplexEval node" in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text
+
+
+def test_qwen_image_backend_similarity_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen-Image Diffusers Backend Similarity", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["source_file_dependencies"] == "diffusion_qwen_image_accuracy"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-backend-similarity/**/*"]
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert '-k "2i_matches_diffusers"' in commands
+    assert "test_diffusers_backend_t2i_matches_diffusers" in commands
+    assert "Expected exactly one Qwen-Image backend similarity node" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "Expected exactly one executed Qwen-Image backend similarity test" in commands
+    accuracy_test = Path("tests/e2e/accuracy/test_diffusers_backend_similarity.py").read_text(encoding="utf-8")
+    assert "torch.version.hip is not None" in accuracy_test
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image Diffusers Backend Similarity" not in text
+
+
+def _assert_nightly_junit_guard(
+    tmp_path: Path,
+    *,
+    step_label: str,
+    command_fragment: str,
+    expected_message: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    step = _find_step(step_label, AMD_NIGHTLY_PIPELINE)
+    run_command = next(command for command in step["commands"] if command_fragment in command)
+    assert expected_message in run_command
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    def write_executable(name: str, body: str) -> None:
+        path = fake_bin / name
+        path.write_text(f"#!/bin/bash\nset -euo pipefail\n{body}", encoding="utf-8")
+        path.chmod(0o755)
+
+    write_executable("rocminfo", "exit 0\n")
+    write_executable(
+        "python3",
+        'if [[ "${1:-}" == "-" ]]; then cat >/dev/null; exit 0; fi\nexec "$REAL_PYTHON" "$@"\n',
+    )
+    write_executable("python", 'exec "$REAL_PYTHON" "$@"\n')
+    write_executable(
+        "timeout",
+        'if [[ -n "${FAKE_TIMEOUT_STATUS:-}" ]]; then exit "$FAKE_TIMEOUT_STATUS"; fi\n'
+        'while [[ "$1" != "pytest" ]]; do shift; done\nexec "$@"\n',
+    )
+    write_executable(
+        "pytest",
+        'xml_path=""\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in --junitxml=*) xml_path="${arg#*=}" ;; esac\n'
+        "done\n"
+        'mkdir -p "$(dirname "$xml_path")"\n'
+        'printf \'<testsuite tests="%s" skipped="%s" failures="0" errors="0"/>\\n\' \\\n'
+        '  "$FAKE_JUNIT_TESTS" "$FAKE_JUNIT_SKIPPED" > "$xml_path"\n'
+        'echo "fake pytest status=$FAKE_PYTEST_STATUS"\n'
+        'exit "$FAKE_PYTEST_STATUS"\n',
+    )
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "REAL_PYTHON": sys.executable,
+            "VLLM_CI_DOCKER_DISABLED": "1",
+            "VLLM_CI_REQUIRE_PERSISTENT_HF_CACHE": "0",
+            "BUILDKITE_JOB_ID": f"{job_id_prefix}-{tmp_path.name}",
+            "HF_HOME": str(tmp_path / "hf"),
+            "FAKE_PYTEST_STATUS": str(pytest_status),
+            "FAKE_JUNIT_TESTS": str(tests),
+            "FAKE_JUNIT_SKIPPED": str(skipped),
+            "FAKE_TIMEOUT_STATUS": "" if timeout_status is None else str(timeout_status),
+            "TEST_COMMANDS": run_command.replace("$$", "$"),
+        }
+    )
+    env[artifact_env] = str(artifact_dir)
+
+    result = subprocess.run(
+        ["bash", str(AMD_RUNNER)],
+        cwd=Path.cwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="Qwen-Image Diffusers Backend Similarity",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly one executed Qwen-Image backend similarity test",
+        artifact_env="ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR",
+        job_id_prefix="qwen-image-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+def test_minicpmo_duplex_function_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o 4.5 Duplex Function", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    marker = "full_model and omni and rocm and MI325 and cards_1"
+    assert marker in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    nodes = (
+        "test_duplex_admission_and_expiry_reaper",
+        "test_duplex_soft_interrupt",
+        "test_duplex_server_vad_hard_interrupt",
+        "test_window_continuous_input[basic-False-three-stage-single-gpu]",
+        "test_window_continuous_input[context-False-three-stage-single-gpu]",
+        "test_window_continuous_input[context-True-three-stage-single-gpu]",
+    )
+    for node in nodes:
+        assert commands.count(node) == 2
+    assert commands.count("--shard-id=0") == 2
+    assert commands.count("--num-shards=1") == 2
+    assert "Expected exactly $${#nodes[@]} MiniCPM-o duplex nodes" in commands
+    assert "Expected exactly six executed MiniCPM-o duplex tests" in commands
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert nightly.count('label: "MiniCPM-o 4.5 Duplex Function"') == 1
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o 4.5 Duplex Function" not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 6, 0, None, 0),
+        (0, 6, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 6, 0, None, 1),
+        (0, 6, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_minicpmo_duplex_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label="MiniCPM-o 4.5 Duplex Function",
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message="Expected exactly six executed MiniCPM-o duplex tests",
+        artifact_env="ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
+        job_id_prefix="minicpmo-duplex-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+def test_qwen_image_expansion_has_separate_nonblocking_card_jobs() -> None:
+    one = _find_step("Qwen-Image Expansion 1 GPU", AMD_NIGHTLY_PIPELINE)
+    two = _find_step("Qwen-Image Expansion 2 GPU", AMD_NIGHTLY_PIPELINE)
+    cases = (
+        (
+            one,
+            "mi300_1",
+            "full_model and diffusion and rocm and MI325 and cards_1",
+            "artifacts/rocm-qwen-image-expansion-1gpu/**/*",
+            (
+                "cpu_offload",
+                "step_execution",
+                "cache_tea_cache",
+                "layerwise_offload",
+            ),
+            "Expected exactly four executed Qwen-Image expansion 1-GPU tests",
+        ),
+        (
+            two,
+            "mi300_2",
+            "full_model and diffusion and rocm and MI325 and cards_2",
+            "artifacts/rocm-qwen-image-expansion-2gpu/**/*",
+            (
+                "ulysses_2",
+                "ring_2",
+                "cfg_parallel_2",
+                "vae_patch_parallel_2",
+                "parallel_hsdp",
+            ),
+            "Expected exactly five executed Qwen-Image expansion 2-GPU tests",
+        ),
+    )
+    for step, agent_pool, marker, artifact_path, nodes, expected_message in cases:
+        assert step["grade"] == "NonBlocking"
+        assert step["agent_pool"] == agent_pool
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 180
+        assert step["source_file_dependencies"] == "diffusion_qwen_image_function"
+        assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+        assert step["artifact_paths"] == [artifact_path]
+        commands = "\n".join(step["commands"])
+        assert marker in commands
+        assert "--run-level full_model" in commands
+        assert "--collect-only" in commands
+        assert "exit 5" in commands
+        assert "pytest.xml" in commands
+        for node in nodes:
+            assert commands.count(f"test_qwen_image[{node}]") == 2
+        assert commands.count("--shard-id=0") == 2
+        assert commands.count("--num-shards=1") == 2
+        assert "Expected exactly $${#nodes[@]} Qwen-Image expansion" in commands
+        assert expected_message in commands
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert nightly.count('label: "Qwen-Image Expansion 1 GPU"') == 1
+    assert nightly.count('label: "Qwen-Image Expansion 2 GPU"') == 1
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image Expansion 1 GPU" not in text
+        assert "Qwen-Image Expansion 2 GPU" not in text
+
+
+@pytest.mark.parametrize(
+    (
+        "step_label",
+        "expected_tests",
+        "expected_message",
+        "artifact_env",
+        "job_id_prefix",
+    ),
+    [
+        (
+            "Qwen-Image Expansion 1 GPU",
+            4,
+            "Expected exactly four executed Qwen-Image expansion 1-GPU tests",
+            "ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR",
+            "qwen-image-expansion-1gpu-guard",
+        ),
+        (
+            "Qwen-Image Expansion 2 GPU",
+            5,
+            "Expected exactly five executed Qwen-Image expansion 2-GPU tests",
+            "ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR",
+            "qwen-image-expansion-2gpu-guard",
+        ),
+    ],
+    ids=("1gpu", "2gpu"),
+)
+@pytest.mark.parametrize(
+    (
+        "pytest_status",
+        "tests_override",
+        "skipped",
+        "timeout_status",
+        "expected_status",
+    ),
+    [
+        (0, None, 0, None, 0),
+        (0, None, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, None, 0, None, 1),
+        (0, None, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen_image_expansion_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    step_label: str,
+    expected_tests: int,
+    expected_message: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    pytest_status: int,
+    tests_override: int | None,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=step_label,
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message=expected_message,
+        artifact_env=artifact_env,
+        job_id_prefix=job_id_prefix,
+        pytest_status=pytest_status,
+        tests=expected_tests if tests_override is None else tests_override,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
