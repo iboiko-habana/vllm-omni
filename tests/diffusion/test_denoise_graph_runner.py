@@ -9,7 +9,12 @@ import torch
 import vllm_omni.diffusion.graph as graph_mod
 import vllm_omni.diffusion.profiler.diffusion_pipeline_profiler as profiler_mod
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.graph import DenoiseGraphRunner, build_denoise_graph_runner, write_through
+from vllm_omni.diffusion.graph import (
+    DenoiseGraphRunner,
+    build_denoise_graph_runner,
+    invalidate_denoise_graphs,
+    write_through,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -173,6 +178,36 @@ def test_capture_failure_disables_runner_and_falls_back_to_eager(fake_graphs, mo
     assert runner.stats_snapshot()["eager"] == 2
 
 
+def test_capture_failure_releases_graphs_captured_earlier(fake_graphs, monkeypatch):
+    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name="t")
+    runner(x=torch.ones(2))
+    assert runner.stats_snapshot()["cache_size"] == 1
+
+    def failing_capture(capture, generators=()):
+        raise RuntimeError("out of memory")
+
+    monkeypatch.setattr(fake_graphs, "capture_graph", failing_capture)
+    out = runner(x=torch.ones(3))
+
+    torch.testing.assert_close(out, torch.full((3,), 3.0))
+    assert not runner.enabled
+    assert runner.stats_snapshot()["cache_size"] == 0
+
+
+def test_invalidate_denoise_graphs_drops_every_runner(fake_graphs):
+    runners = [DenoiseGraphRunner(fn=fake_graphs.wrap(_affine), name=f"t{i}") for i in range(2)]
+    for runner in runners:
+        runner(x=torch.ones(2))
+
+    invalidate_denoise_graphs("adapter changed")
+
+    for runner in runners:
+        assert runner.enabled
+        assert runner.stats_snapshot()["cache_size"] == 0
+        torch.testing.assert_close(runner(x=torch.zeros(2)), torch.full((2,), 1.0))
+        assert runner.stats_snapshot()["captures"] == 2
+
+
 def test_non_tensor_return_disables_runner(fake_graphs):
     runner = DenoiseGraphRunner(fn=lambda x: {"out": x}, name="t")
 
@@ -278,6 +313,8 @@ def test_build_runner_when_requested_and_safe():
         ({"cache_backend": "cache_dit"}, None),
         ({"enable_cpu_offload": True}, None),
         ({"enable_layerwise_offload": True}, None),
+        ({"enable_distributed_layerwise_offload": True}, None),
+        ({"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}}, None),
         ({"parallel_config": SimpleNamespace(pipeline_parallel_size=2)}, None),
         ({}, "pipeline-specific reason"),
     ],
