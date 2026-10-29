@@ -478,19 +478,16 @@ class HunyuanImage3Pipeline(
     def _build_denoise_graph_runner(self) -> "DenoiseGraphRunner | None":
         """Set up device-graph replay for the denoise steps, if it is safe here.
 
-        Returns None (stay eager) unless the request opts in *and* nothing in the
-        configuration makes a step depend on which step it is -- a captured graph
-        replays one frozen kernel sequence, so any per-step branch would be
-        silently pinned to whatever the capture step chose.
+        Returns None (stay eager) unless the request opts in and nothing in the
+        configuration makes a step depend on which step it is; see
+        :func:`build_denoise_graph_runner`. With a runner, the prompt KV keeps its
+        storage across requests so one capture can serve more than one request.
         """
-        refusal = (
-            "diffusion_kv_cache_skip_steps makes KV quantization depend on the step index"
-            if getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None)
-            else None
-        )
-        return build_denoise_graph_runner(
-            self.od_config, self._denoise_graph_forward, "HunyuanImage3 DiT", refusal=refusal
-        )
+        runner = build_denoise_graph_runner(self.od_config, self._denoise_graph_forward, "HunyuanImage3 DiT")
+        if runner is not None:
+            for layer in self.model.layers:
+                layer.self_attn.image_attn.retain_prompt_kv_storage = True
+        return runner
 
     def _denoise_graph_forward(self, **model_inputs: Any) -> torch.Tensor:
         """The graph body: one non-first denoise step, reduced to its one tensor.

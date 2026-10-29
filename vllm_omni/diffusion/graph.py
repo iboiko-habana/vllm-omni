@@ -306,14 +306,38 @@ def invalidate_denoise_graphs(reason: str) -> None:
         runner.invalidate(reason)
 
 
-def _first_tensor_device(kwargs: Mapping[str, Any]) -> torch.device | None:
-    for value in kwargs.values():
-        if isinstance(value, torch.Tensor):
-            return value.device
-        if isinstance(value, (list, tuple)):
-            for inner in value:
-                if isinstance(inner, torch.Tensor):
-                    return inner.device
+def _first_tensor_device(value: Any) -> torch.device | None:
+    """Device of the first tensor found, walking the same containers as _clone_static."""
+    if isinstance(value, torch.Tensor):
+        return value.device
+    if isinstance(value, Mapping):
+        value = value.values()
+    elif not isinstance(value, (list, tuple)):
+        return None
+    for inner in value:
+        if (device := _first_tensor_device(inner)) is not None:
+            return device
+    return None
+
+
+def _step_dependent_attention(od_config: Any) -> str | None:
+    """Why attention would change from one denoise step to the next, if it would.
+
+    Attention layers read the step index or timestep off the forward context, not
+    off the step's arguments, so a replay would keep the capture step's choice.
+    """
+    kv_cache_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
+    if kv_cache_dtype not in (None, "auto", "float") and getattr(
+        od_config, "diffusion_kv_cache_skip_step_indices", None
+    ):
+        return "diffusion_kv_cache_skip_steps makes KV quantization depend on the step index"
+    attention_config = getattr(od_config, "diffusion_attention_config", None)
+    if attention_config is not None:
+        specs = [attention_config.default, *attention_config.per_role.values()]
+        for spec in specs:
+            skip_softmax = getattr(spec, "skip_softmax", None)
+            if skip_softmax is not None and skip_softmax.disabled_until_timestep > 0:
+                return "TRTLLM_ATTN skip_softmax.disabled_until_timestep makes attention depend on the timestep"
     return None
 
 
@@ -347,6 +371,8 @@ def build_denoise_graph_runner(
         # mapping) from the forward context, not from the step's arguments, so
         # a replay would keep reading the capture-time request's KV layout.
         refusal = f"diffusion_kv_mode={kv_mode.value!r} reads per-request paged KV state outside the step arguments"
+    if refusal is None:
+        refusal = _step_dependent_attention(od_config)
     if refusal is None and cache_backend != "none":
         refusal = f"cache_backend={cache_backend!r} decides per step whether the transformer runs at all"
     if refusal is None and offload_enabled(od_config):

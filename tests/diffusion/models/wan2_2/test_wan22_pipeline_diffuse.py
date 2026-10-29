@@ -756,3 +756,29 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expect_runner"),
+    [
+        ({}, True),
+        ({"diffusion_kv_cache_skip_step_indices": (1,)}, True),
+        ({"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": (1,)}, False),
+    ],
+    ids=["on", "skip-steps-without-kv-quant", "fp8-kv-skip-steps"],
+)
+def test_denoise_graph_runner_refuses_step_dependent_kv_quant(overrides, expect_runner):
+    # Wan publishes denoise_step_idx every step, so skip_steps would switch the
+    # KV dtype per step; a replay would keep the capture step's choice.
+    od_config = SimpleNamespace(
+        diffusion_use_graph=True,
+        enforce_eager=False,
+        cache_backend="none",
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        diffusion_kv_cache_skip_step_indices=None,
+    )
+    vars(od_config).update(overrides)
+
+    assert (_make_pipeline()._build_denoise_graph_runner(od_config) is not None) == expect_runner

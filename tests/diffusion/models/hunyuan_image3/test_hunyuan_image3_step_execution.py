@@ -44,6 +44,9 @@ def _pipeline():
     pipeline._pipeline = SimpleNamespace()
     pipeline._denoise_graph_runner = None
     pipeline._denoise_forward_logged = False
+    pipeline.model = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(image_attn=SimpleNamespace(retain_prompt_kv_storage=False)))]
+    )
     return pipeline
 
 
@@ -580,16 +583,51 @@ def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
     [
         ({"diffusion_use_graph": False}, False),
         ({"diffusion_use_graph": True}, True),
-        ({"diffusion_use_graph": True, "diffusion_kv_cache_skip_step_indices": (1,)}, False),
+        ({"diffusion_use_graph": True, "diffusion_kv_cache_skip_step_indices": (1,)}, True),
+        (
+            {
+                "diffusion_use_graph": True,
+                "diffusion_kv_cache_dtype": "fp8",
+                "diffusion_kv_cache_skip_step_indices": (1,),
+            },
+            False,
+        ),
         ({"diffusion_use_graph": True, "cache_backend": "cache_dit"}, False),
     ],
-    ids=["off", "on", "kv-skip-steps", "cache-backend"],
+    ids=["off", "on", "skip-steps-without-kv-quant", "fp8-kv-skip-steps", "cache-backend"],
 )
 def test_denoise_graph_runner_is_built_only_when_step_independent(overrides, expect_runner):
     pipeline = _pipeline()
     pipeline.od_config = SimpleNamespace(**{**vars(pipeline.od_config), **overrides})
 
     assert (pipeline._build_denoise_graph_runner() is not None) == expect_runner
+    # Only a runner needs the prompt KV to keep its storage across requests.
+    assert pipeline.model.layers[0].self_attn.image_attn.retain_prompt_kv_storage == expect_runner
+
+
+@pytest.mark.parametrize("retain", [False, True], ids=["graphs-off", "graphs-on"])
+def test_set_prompt_kv_cache_writes_through_only_with_graphs(retain):
+    mgr = object.__new__(ImageKVCacheManager)
+    torch.nn.Module.__init__(mgr)
+    mgr.retain_prompt_kv_storage = retain
+    mgr._prompt_kv_storage = None
+    mgr._prompt_kv_lens_storage = None
+    mgr.prompt_kv_reallocated = False
+    first = (torch.zeros(1, 2, 1, 4), torch.zeros(1, 2, 1, 4), torch.tensor([2]))
+    second = (torch.ones(1, 2, 1, 4), torch.ones(1, 2, 1, 4), torch.tensor([1]))
+
+    mgr.set_prompt_kv_cache(*first)
+    mgr.prompt_kv_reallocated = False
+    mgr.set_prompt_kv_cache(*second)
+
+    key, value = mgr.image_kv_cache_map
+    torch.testing.assert_close(key, second[0])
+    torch.testing.assert_close(value, second[1])
+    torch.testing.assert_close(mgr.image_kv_cache_lens, second[2])
+    # Graphs on: the second request lands in the first request's storage. Off: plain rebinding, as on main.
+    assert (key is first[0]) == retain
+    assert (key is second[0]) == (not retain)
+    assert mgr.prompt_kv_reallocated is False
 
 
 def test_denoise_forward_replays_only_later_gen_image_steps():

@@ -917,6 +917,9 @@ class ImageKVCacheManager(nn.Module):
         # Set when that storage had to move; read and cleared by the pipeline, which
         # then drops any graph whose recorded kernels point at the old buffers.
         self.prompt_kv_reallocated: bool = False
+        # Set by the pipeline when denoise graphs are on; otherwise the prompt KV
+        # is plainly rebound per request, as without graphs.
+        self.retain_prompt_kv_storage: bool = False
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
@@ -1003,14 +1006,18 @@ class ImageKVCacheManager(nn.Module):
         return key, value
 
     def set_prompt_kv_cache(self, key: torch.Tensor, value: torch.Tensor, lens: torch.Tensor) -> None:
-        """Publish the prompt KV for the denoise steps, keeping the storage put.
+        """Publish the prompt KV for the denoise steps.
 
-        The denoise steps read these buffers off the module rather than off their
-        arguments, so a captured graph holds their addresses directly: reusing the
-        storage whenever the shape allows is what lets one capture serve more than
-        one request. Where it cannot be reused, ``prompt_kv_reallocated`` says so
-        and the pipeline drops the graphs that just became stale.
+        With denoise graphs on, the steps read these buffers off the module rather
+        than off their arguments, so a captured graph holds their addresses directly:
+        reusing the storage whenever the shape allows is what lets one capture serve
+        more than one request. Where it cannot be reused, ``prompt_kv_reallocated``
+        says so and the pipeline drops the graphs that just became stale.
         """
+        if not self.retain_prompt_kv_storage:
+            self.image_kv_cache_map = (key, value)
+            self.image_kv_cache_lens = lens
+            return
         prev_key, prev_value = self._prompt_kv_storage or (None, None)
         reused_key = write_through(prev_key, key)
         reused_value = write_through(prev_value, value)

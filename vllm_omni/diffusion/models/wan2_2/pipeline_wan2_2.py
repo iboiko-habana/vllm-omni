@@ -26,7 +26,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
-from vllm_omni.diffusion.graph import build_denoise_graph_runner
+from vllm_omni.diffusion.graph import DenoiseGraphRunner, build_denoise_graph_runner
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -659,7 +659,10 @@ class Wan22Pipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-        self._denoise_graph_runner = build_denoise_graph_runner(
+        self._denoise_graph_runner = self._build_denoise_graph_runner(od_config)
+
+    def _build_denoise_graph_runner(self, od_config: OmniDiffusionConfig) -> DenoiseGraphRunner | None:
+        return build_denoise_graph_runner(
             od_config,
             self._denoise_graph_forward,
             "Wan DiT",

@@ -8,6 +8,7 @@ import torch
 
 import vllm_omni.diffusion.graph as graph_mod
 import vllm_omni.diffusion.profiler.diffusion_pipeline_profiler as profiler_mod
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, SkipSoftmaxSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.graph import (
     DenoiseGraphRunner,
@@ -119,6 +120,16 @@ def test_nested_tensor_arguments_are_refreshed(fake_graphs):
 
     torch.testing.assert_close(out, torch.full((2,), 7.0))
     assert runner.stats_snapshot()["hits"] == 1
+
+
+def test_tensors_only_inside_nested_dicts_are_captured_and_replayed(fake_graphs):
+    runner = DenoiseGraphRunner(fn=fake_graphs.wrap(lambda cond, scale: cond["inner"]["x"] * scale), name="t")
+    runner(cond={"inner": {"x": torch.ones(2)}}, scale=2.0)
+
+    out = runner(cond={"inner": {"x": torch.full((2,), 3.0)}}, scale=2.0)
+
+    torch.testing.assert_close(out, torch.full((2,), 6.0))
+    assert runner.stats_snapshot() == {"calls": 2, "hits": 1, "captures": 1, "eager": 0, "cache_size": 1}
 
 
 def test_new_shape_or_flag_captures_separately_with_lru_eviction(fake_graphs):
@@ -283,6 +294,11 @@ def test_profiler_skips_synchronize_during_capture(monkeypatch, capturing, expec
     assert len(syncs) == expected_syncs
 
 
+_GATED_SKIP_SOFTMAX = AttentionSpec(
+    backend="TRTLLM_ATTN", skip_softmax=SkipSoftmaxSpec(threshold=0.1, disabled_until_timestep=0.5)
+)
+
+
 def _od_config(**overrides):
     fields = dict(
         diffusion_use_graph=True,
@@ -316,11 +332,32 @@ def test_build_runner_when_requested_and_safe():
         ({"enable_distributed_layerwise_offload": True}, None),
         ({"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}}, None),
         ({"parallel_config": SimpleNamespace(pipeline_parallel_size=2)}, None),
+        ({"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": (1,)}, None),
+        ({"diffusion_attention_config": AttentionConfig(default=_GATED_SKIP_SOFTMAX)}, None),
+        ({"diffusion_attention_config": AttentionConfig(per_role={"self": _GATED_SKIP_SOFTMAX})}, None),
         ({}, "pipeline-specific reason"),
     ],
 )
 def test_build_runner_stays_eager_when_unsafe(overrides, refusal):
     assert build_denoise_graph_runner(_od_config(**overrides), lambda x: x, "T", refusal=refusal) is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": ()},
+        {"diffusion_kv_cache_skip_step_indices": (1,)},
+        {"diffusion_kv_cache_dtype": "auto", "diffusion_kv_cache_skip_step_indices": (1,)},
+        {
+            "diffusion_attention_config": AttentionConfig(
+                default=AttentionSpec(backend="TRTLLM_ATTN", skip_softmax=SkipSoftmaxSpec(threshold=0.1))
+            )
+        },
+    ],
+    ids=["no-skip-steps", "skip-steps-without-kv-quant", "skip-steps-with-auto-kv", "ungated-skip-softmax"],
+)
+def test_build_runner_allows_step_independent_attention(overrides):
+    assert isinstance(build_denoise_graph_runner(_od_config(**overrides), lambda x: x, "T"), DenoiseGraphRunner)
 
 
 def test_is_capturing_is_false_for_cpu():
