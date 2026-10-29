@@ -254,16 +254,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return
 
         compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        graph_layer = None
         if getattr(model, "enable_cuda_graph_decode", False):
-            # Decode-graph models still compile their blocks: graph capture
-            # records the compiled (fused) kernels. Scope inductor cudagraphs
-            # to this compile so the two graph layers never stack, without
-            # changing torch.compile for every other model in the process.
+            graph_layer = "CUDA graph decode"
+        elif getattr(self.od_config, "diffusion_use_graph", False):
+            graph_layer = "denoise graphs"
+        if graph_layer is not None:
+            # Graph capture records the compiled (fused) kernels. Scope inductor
+            # cudagraphs to this compile so the two graph layers never stack,
+            # without changing torch.compile for every other model in the process.
             compile_kwargs["options"] = {
                 "triton.cudagraphs": False,
                 "triton.cudagraph_trees": False,
             }
-            logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
+            logger.info("Model runner: %s combines %s with torch.compile.", attr_name, graph_layer)
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         try:
